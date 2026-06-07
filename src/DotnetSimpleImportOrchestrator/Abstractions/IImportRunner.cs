@@ -2,8 +2,8 @@ namespace DotnetSimpleImportOrchestrator.Abstractions;
 
 public interface IImportRunner
 {
-    ValueTask<ImportRunResult> RunDueImportsAsync(
-        IReadOnlyList<ImportDefinition> definitions,
+    ValueTask<ImportRunResult> RunOnceAsync(
+        IReadOnlyList<IImportDefinition> imports,
         ImportRuntimeState state,
         CancellationToken cancellationToken = default);
 }

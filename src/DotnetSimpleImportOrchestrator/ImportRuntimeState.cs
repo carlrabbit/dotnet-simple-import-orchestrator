@@ -9,9 +9,7 @@ public sealed record ImportRuntimeState
 
 public sealed record ImportState
 {
-    public DateTimeOffset? LastPollStartedAt { get; init; }
-
-    public DateTimeOffset? LastPollCompletedAt { get; init; }
+    public DateTimeOffset? LastCheckedAt { get; init; }
 
     public DateTimeOffset? LastSuccessfulImportAt { get; init; }
 

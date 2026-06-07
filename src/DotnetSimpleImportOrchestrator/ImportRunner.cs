@@ -5,175 +5,259 @@ namespace DotnetSimpleImportOrchestrator;
 
 public sealed class ImportRunner : IImportRunner
 {
-    private readonly IReadOnlyDictionary<string, IImportSource> _sources;
-    private readonly IReadOnlyDictionary<string, IImportHandler> _handlers;
+    private readonly IReadOnlyDictionary<string, ImportSourceFactoryRegistration> _sourceFactories;
+    private readonly IReadOnlyDictionary<string, ImportHandlerRegistration> _handlers;
     private readonly TimeProvider _timeProvider;
 
     public ImportRunner(
-        IReadOnlyDictionary<string, IImportSource> sources,
-        IReadOnlyDictionary<string, IImportHandler> handlers,
+        IReadOnlyDictionary<string, ImportSourceFactoryRegistration> sourceFactories,
+        IReadOnlyDictionary<string, ImportHandlerRegistration> handlers,
         TimeProvider? timeProvider = null)
     {
-        _sources = sources;
+        _sourceFactories = sourceFactories;
         _handlers = handlers;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public async ValueTask<ImportRunResult> RunDueImportsAsync(
-        IReadOnlyList<ImportDefinition> definitions,
+    public async ValueTask<ImportRunResult> RunOnceAsync(
+        IReadOnlyList<IImportDefinition> imports,
         ImportRuntimeState state,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(definitions);
+        ArgumentNullException.ThrowIfNull(imports);
         ArgumentNullException.ThrowIfNull(state);
 
-        Dictionary<string, ImportState> imports = CloneImports(state.Imports);
-        List<ImportAttemptResult> attempts = [];
+        IImportDefinition[] snapshot = imports.ToArray();
+        ValidateSnapshot(snapshot);
 
-        foreach (ImportDefinition definition in definitions)
+        Dictionary<string, ImportState> updatedImports = CloneImports(state.Imports);
+        DateTimeOffset now = _timeProvider.GetUtcNow();
+        List<ImportCheckResult> checks = [];
+        List<IImportDefinition> dueImports = [];
+
+        foreach (IImportDefinition import in snapshot)
+        {
+            ImportState importState = updatedImports.TryGetValue(import.Id, out ImportState? existingState)
+                ? existingState
+                : new ImportState();
+            if (IsDue(import, importState, now))
+            {
+                dueImports.Add(import);
+            }
+            else
+            {
+                checks.Add(new ImportCheckResult
+                {
+                    ImportId = import.Id,
+                    Outcome = ImportCheckOutcome.NotDue,
+                    Message = "Import is not due."
+                });
+            }
+        }
+
+        foreach (IImportDefinition import in dueImports
+            .OrderBy(static item => item.Priority)
+            .ThenBy(static item => item.Id, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (!definition.Enabled)
+            ImportState currentState = GetState(updatedImports, import.Id);
+            DateTimeOffset checkedAt = _timeProvider.GetUtcNow();
+
+            if (!_sourceFactories.TryGetValue(import.Id, out ImportSourceFactoryRegistration? sourceFactory))
             {
-                attempts.Add(new ImportAttemptResult
-                {
-                    ImportId = definition.Id,
-                    Skipped = true,
-                    Message = "Import is disabled."
-                });
-                continue;
+                throw new InvalidOperationException($"No source factory is registered for import '{import.Id}'.");
             }
 
-            ImportState currentState = GetState(imports, definition.Id);
-            DateTimeOffset startedAt = _timeProvider.GetUtcNow();
-            if (!IsDue(definition, currentState, startedAt))
+            if (!_handlers.TryGetValue(import.Id, out ImportHandlerRegistration? handler))
             {
-                attempts.Add(new ImportAttemptResult
-                {
-                    ImportId = definition.Id,
-                    Skipped = true,
-                    Message = "Import is not due."
-                });
-                continue;
+                throw new InvalidOperationException($"No handler is registered for import '{import.Id}'.");
             }
 
-            currentState = currentState with { LastPollStartedAt = startedAt };
-            imports[definition.Id] = currentState;
-
-            if (!_sources.TryGetValue(definition.SourceName, out IImportSource? source))
-            {
-                currentState = RecordError(currentState, new InvalidOperationException(
-                    $"No import source is registered for '{definition.SourceName}'."), startedAt);
-                imports[definition.Id] = currentState with { LastPollCompletedAt = startedAt };
-                attempts.Add(FailedAttempt(definition.Id, null, currentState.LastError!.Message));
-                continue;
-            }
-
-            if (!_handlers.TryGetValue(definition.HandlerName, out IImportHandler? handler))
-            {
-                currentState = RecordError(currentState, new InvalidOperationException(
-                    $"No import handler is registered for '{definition.HandlerName}'."), startedAt);
-                imports[definition.Id] = currentState with { LastPollCompletedAt = startedAt };
-                attempts.Add(FailedAttempt(definition.Id, null, currentState.LastError!.Message));
-                continue;
-            }
-
-            IReadOnlyList<ImportCandidate> candidates;
+            IImportSource source;
             try
             {
-                candidates = await source.PollAsync(new ImportSourceContext
+                source = await sourceFactory.CreateAsync(import, currentState, _timeProvider, cancellationToken);
+                if (source is null)
                 {
-                    Definition = definition,
-                    State = currentState,
-                    StartedAt = startedAt
-                }, cancellationToken);
+                    throw new InvalidOperationException($"Source factory for import '{import.Id}' returned null.");
+                }
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
-                currentState = RecordError(currentState, exception, startedAt);
-                imports[definition.Id] = currentState with { LastPollCompletedAt = startedAt };
-                attempts.Add(FailedAttempt(definition.Id, null, exception.Message, exception));
+                currentState = RecordError(currentState, exception, checkedAt);
+                updatedImports[import.Id] = currentState;
+                checks.Add(FailedCheck(import.Id, ImportCheckOutcome.SourceFailed, null, exception.Message, exception));
                 continue;
             }
 
-            foreach (ImportCandidate candidate in candidates)
+            ImportPollResult pollResult;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    await using Stream payload = await candidate.OpenReadAsync(cancellationToken);
-                    ImportHandlingResult handlingResult = await handler.HandleAsync(new ImportHandlingContext
+                pollResult = await source.PollAsync(
+                    new ImportPollContext
                     {
-                        Definition = definition,
-                        Candidate = candidate,
+                        ImportId = import.Id,
                         State = currentState,
-                        StartedAt = startedAt
-                    }, payload, cancellationToken);
-
-                    if (!handlingResult.Succeeded)
-                    {
-                        string message = handlingResult.FailureMessage ?? "Import handler reported failure.";
-                        currentState = currentState with
-                        {
-                            LastError = new ImportError
-                            {
-                                Message = message,
-                                ErrorType = "ImportHandlingFailure",
-                                OccurredAt = _timeProvider.GetUtcNow()
-                            }
-                        };
-                        imports[definition.Id] = currentState;
-                        attempts.Add(FailedAttempt(definition.Id, candidate.SourceItemId, message));
-                        continue;
-                    }
-
-                    currentState = currentState with
-                    {
-                        LastSuccessfulImportAt = _timeProvider.GetUtcNow(),
-                        LastError = null,
-                        Cursor = MergeCursor(currentState.Cursor, handlingResult.Cursor)
-                    };
-                    imports[definition.Id] = currentState;
-                    attempts.Add(new ImportAttemptResult
-                    {
-                        ImportId = definition.Id,
-                        SourceItemId = candidate.SourceItemId,
-                        Succeeded = true
-                    });
-                }
-                catch (Exception exception) when (exception is not OperationCanceledException)
-                {
-                    currentState = RecordError(currentState, exception, _timeProvider.GetUtcNow());
-                    imports[definition.Id] = currentState;
-                    attempts.Add(FailedAttempt(definition.Id, candidate.SourceItemId, exception.Message, exception));
-                }
+                        TimeProvider = _timeProvider
+                    },
+                    cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                currentState = RecordError(currentState, exception, checkedAt);
+                updatedImports[import.Id] = currentState;
+                checks.Add(FailedCheck(import.Id, ImportCheckOutcome.SourceFailed, null, exception.Message, exception));
+                continue;
             }
 
-            imports[definition.Id] = currentState with { LastPollCompletedAt = _timeProvider.GetUtcNow() };
+            if (pollResult.Candidate is null)
+            {
+                currentState = currentState with
+                {
+                    LastCheckedAt = checkedAt,
+                    LastError = null,
+                    Cursor = MergeCursor(currentState.Cursor, pollResult.CursorUpdate)
+                };
+                updatedImports[import.Id] = currentState;
+                checks.Add(new ImportCheckResult
+                {
+                    ImportId = import.Id,
+                    Outcome = ImportCheckOutcome.NoCandidate,
+                    Message = "No candidate was available."
+                });
+                continue;
+            }
+
+            ImportCandidate candidate = pollResult.Candidate;
+            try
+            {
+                await using Stream payload = await candidate.OpenReadAsync(cancellationToken);
+                ImportHandlingResult handlingResult = await handler.HandleAsync(
+                    import,
+                    candidate,
+                    currentState,
+                    payload,
+                    cancellationToken);
+
+                if (!handlingResult.Succeeded)
+                {
+                    string message = handlingResult.ErrorMessage ?? "Import handler reported failure.";
+                    currentState = currentState with
+                    {
+                        LastCheckedAt = checkedAt,
+                        LastError = new ImportError
+                        {
+                            Message = message,
+                            ErrorType = "ImportHandlingFailure",
+                            OccurredAt = checkedAt
+                        }
+                    };
+                    updatedImports[import.Id] = currentState;
+                    checks.Add(FailedCheck(import.Id, ImportCheckOutcome.HandlerFailed, candidate.SourceItemId, message));
+                    continue;
+                }
+
+                currentState = currentState with
+                {
+                    LastCheckedAt = checkedAt,
+                    LastSuccessfulImportAt = _timeProvider.GetUtcNow(),
+                    LastError = null,
+                    Cursor = MergeCursor(
+                        MergeCursor(currentState.Cursor, pollResult.CursorUpdate),
+                        handlingResult.CursorUpdate)
+                };
+                updatedImports[import.Id] = currentState;
+                checks.Add(new ImportCheckResult
+                {
+                    ImportId = import.Id,
+                    Outcome = ImportCheckOutcome.Imported,
+                    SourceItemId = candidate.SourceItemId
+                });
+
+                return new ImportRunResult
+                {
+                    State = new ImportRuntimeState { Imports = updatedImports },
+                    SuccessfulImportPerformed = true,
+                    SuccessfulImportId = import.Id,
+                    Checks = checks
+                };
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                currentState = RecordError(currentState, exception, checkedAt);
+                updatedImports[import.Id] = currentState;
+                checks.Add(FailedCheck(import.Id, ImportCheckOutcome.HandlerFailed, candidate.SourceItemId, exception.Message, exception));
+            }
         }
 
         return new ImportRunResult
         {
-            State = new ImportRuntimeState { Imports = imports },
-            Attempts = attempts
+            State = new ImportRuntimeState { Imports = updatedImports },
+            SuccessfulImportPerformed = false,
+            Checks = checks
         };
     }
 
-    private static bool IsDue(ImportDefinition definition, ImportState state, DateTimeOffset now)
+    private void ValidateSnapshot(IReadOnlyList<IImportDefinition> imports)
     {
-        if (definition.Polling.Interval is null)
+        HashSet<string> ids = new(StringComparer.Ordinal);
+        for (int i = 0; i < imports.Count; i++)
+        {
+            IImportDefinition? import = imports[i];
+            if (import is null)
+            {
+                throw new ArgumentException($"Import at index {i} is null.", nameof(imports));
+            }
+
+            if (string.IsNullOrWhiteSpace(import.Id))
+            {
+                throw new ArgumentException("Import ID must be non-empty.", nameof(imports));
+            }
+
+            if (!ids.Add(import.Id))
+            {
+                throw new ArgumentException($"Duplicate import ID '{import.Id}'.", nameof(imports));
+            }
+
+            if (import.Polling is null)
+            {
+                throw new ArgumentException($"Import '{import.Id}' has no polling options.", nameof(imports));
+            }
+
+            if (import.Polling.Interval <= TimeSpan.Zero)
+            {
+                throw new ArgumentException($"Import '{import.Id}' polling interval must be positive.", nameof(imports));
+            }
+
+            if (import.Configuration is null)
+            {
+                throw new ArgumentException($"Import '{import.Id}' configuration must be non-null.", nameof(imports));
+            }
+        }
+
+        foreach (IImportDefinition import in imports)
+        {
+            if (!_sourceFactories.ContainsKey(import.Id))
+            {
+                throw new InvalidOperationException($"No source factory is registered for import '{import.Id}'.");
+            }
+
+            if (!_handlers.ContainsKey(import.Id))
+            {
+                throw new InvalidOperationException($"No handler is registered for import '{import.Id}'.");
+            }
+        }
+    }
+
+    private static bool IsDue(IImportDefinition import, ImportState state, DateTimeOffset now)
+    {
+        if (state.LastCheckedAt is null)
         {
             return true;
         }
 
-        if (state.LastPollCompletedAt is null)
-        {
-            return true;
-        }
-
-        return state.LastPollCompletedAt.Value + definition.Polling.Interval <= now;
+        return state.LastCheckedAt.Value + import.Polling.Interval <= now;
     }
 
     private static ImportState GetState(Dictionary<string, ImportState> imports, string importId)
@@ -191,11 +275,13 @@ public sealed class ImportRunner : IImportRunner
     private static Dictionary<string, ImportState> CloneImports(IReadOnlyDictionary<string, ImportState> imports) =>
         imports.ToDictionary(
             static pair => pair.Key,
-            static pair => pair.Value with { Cursor = CloneJsonObject(pair.Value.Cursor) });
+            static pair => pair.Value with { Cursor = CloneJsonObject(pair.Value.Cursor) },
+            StringComparer.Ordinal);
 
     private static ImportState RecordError(ImportState state, Exception exception, DateTimeOffset occurredAt) =>
         state with
         {
+            LastCheckedAt = occurredAt,
             LastError = new ImportError
             {
                 Message = exception.Message,
@@ -204,14 +290,16 @@ public sealed class ImportRunner : IImportRunner
             }
         };
 
-    private static ImportAttemptResult FailedAttempt(
+    private static ImportCheckResult FailedCheck(
         string importId,
+        ImportCheckOutcome outcome,
         string? sourceItemId,
         string message,
         Exception? exception = null) =>
         new()
         {
             ImportId = importId,
+            Outcome = outcome,
             SourceItemId = sourceItemId,
             Message = message,
             Exception = exception

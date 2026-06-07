@@ -1,25 +1,43 @@
-using System.Text.Json.Nodes;
-
 namespace DotnetSimpleImportOrchestrator;
 
-public sealed record ImportDefinition
+public interface IImportConfiguration
+{
+}
+
+public interface IImportDefinition
+{
+    string Id { get; }
+
+    int Priority { get; }
+
+    PollingOptions Polling { get; }
+
+    IImportConfiguration Configuration { get; }
+}
+
+public sealed record ImportDefinition<TConfiguration> : IImportDefinition
+    where TConfiguration : IImportConfiguration
 {
     public required string Id { get; init; }
 
-    public required string SourceName { get; init; }
+    public int Priority { get; init; } = ImportPriorities.Normal;
 
-    public required string HandlerName { get; init; }
+    public required PollingOptions Polling { get; init; }
 
-    public ImportPayloadFormat Format { get; init; }
+    public required TConfiguration Configuration { get; init; }
 
-    public bool Enabled { get; init; } = true;
+    IImportConfiguration IImportDefinition.Configuration => Configuration;
+}
 
-    public PollingOptions Polling { get; init; } = new();
-
-    public JsonObject Source { get; init; } = [];
+public static class ImportPriorities
+{
+    public const int Highest = 0;
+    public const int High = 100;
+    public const int Normal = 500;
+    public const int Low = 900;
 }
 
 public sealed record PollingOptions
 {
-    public TimeSpan? Interval { get; init; }
+    public required TimeSpan Interval { get; init; }
 }

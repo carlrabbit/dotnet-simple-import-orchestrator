@@ -2,7 +2,7 @@ namespace DotnetSimpleImportOrchestrator.Abstractions;
 
 public interface IImportSource
 {
-    ValueTask<IReadOnlyList<ImportCandidate>> PollAsync(
-        ImportSourceContext context,
+    ValueTask<ImportPollResult> PollAsync(
+        ImportPollContext context,
         CancellationToken cancellationToken);
 }

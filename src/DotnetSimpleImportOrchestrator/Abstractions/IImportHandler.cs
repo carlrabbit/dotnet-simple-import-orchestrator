@@ -1,9 +1,10 @@
 namespace DotnetSimpleImportOrchestrator.Abstractions;
 
-public interface IImportHandler
+public interface IImportHandler<TConfiguration>
+    where TConfiguration : IImportConfiguration
 {
     ValueTask<ImportHandlingResult> HandleAsync(
-        ImportHandlingContext context,
+        ImportHandlingContext<TConfiguration> context,
         Stream payload,
         CancellationToken cancellationToken);
 }

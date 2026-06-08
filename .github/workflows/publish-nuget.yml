@@ -1,0 +1,205 @@
+name: publish-nuget
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to publish, for example 1.0.0"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-nuget-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      PACKAGE_ID: DotnetSimpleImportOrchestrator
+      PROJECT_PATH: src/DotnetSimpleImportOrchestrator/DotnetSimpleImportOrchestrator.csproj
+      PACKAGE_DIR: artifacts/nuget
+      NUGET_SOURCE: https://api.nuget.org/v3/index.json
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Validate input
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.version }}"
+
+          if [ -z "$version" ]; then
+            echo "Version input is required." >&2
+            exit 1
+          fi
+
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "NUGET_API_KEY secret is required." >&2
+            exit 1
+          fi
+
+          # Conservative SemVer-ish gate.
+          # Allows: 1.0.0, 1.0.0-preview.1, 1.0.0-rc.1
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Version must look like SemVer, for example 1.0.0 or 1.0.0-preview.1." >&2
+            exit 1
+          fi
+
+      - name: Check whether package version already exists on NuGet
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_id="${PACKAGE_ID}"
+          version="${{ inputs.version }}"
+
+          lower_package_id="$(printf '%s' "$package_id" | tr '[:upper:]' '[:lower:]')"
+          lower_version="$(printf '%s' "$version" | tr '[:upper:]' '[:lower:]')"
+
+          version_index_url="https://api.nuget.org/v3-flatcontainer/${lower_package_id}/index.json"
+
+          echo "Checking NuGet package version:"
+          echo "  package: $package_id"
+          echo "  version: $version"
+          echo "  url:     $version_index_url"
+
+          http_status="$(curl -sS -o nuget-versions.json -w '%{http_code}' "$version_index_url")"
+
+          if [ "$http_status" = "404" ]; then
+            echo "Package does not exist on NuGet yet. Continuing."
+            exit 0
+          fi
+
+          if [ "$http_status" != "200" ]; then
+            echo "Unexpected NuGet response status: $http_status" >&2
+            cat nuget-versions.json >&2 || true
+            exit 1
+          fi
+
+          python3 - "$lower_version" <<'PY'
+          import json
+          import sys
+
+          requested = sys.argv[1]
+
+          with open("nuget-versions.json", "r", encoding="utf-8") as file:
+              payload = json.load(file)
+
+          versions = {str(value).lower() for value in payload.get("versions", [])}
+
+          if requested in versions:
+              print(f"Package version already exists on NuGet: {requested}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Package version is not present on NuGet: {requested}")
+          PY
+
+      - name: Restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet build --no-restore --configuration Release
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet test --no-build --configuration Release
+
+      - name: Format check
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet format --verify-no-changes
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.version }}"
+
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR"
+
+          dotnet pack "$PROJECT_PATH" \
+            --configuration Release \
+            --no-build \
+            --output "$PACKAGE_DIR" \
+            -p:PackageVersion="$version"
+
+          expected_package="$PACKAGE_DIR/$PACKAGE_ID.$version.nupkg"
+
+          if [ ! -f "$expected_package" ]; then
+            echo "Expected package was not produced: $expected_package" >&2
+            echo "Produced files:" >&2
+            find "$PACKAGE_DIR" -maxdepth 1 -type f -print | sort >&2
+            exit 1
+          fi
+
+      - name: Package smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.version }}"
+          tmp_root="$(mktemp -d)"
+          trap 'rm -rf "$tmp_root"' EXIT INT TERM
+
+          consumer_dir="$tmp_root/consumer"
+
+          dotnet new console --framework net10.0 --output "$consumer_dir" >/dev/null
+
+          cat > "$consumer_dir/NuGet.Config" <<NUGET
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$(pwd)/$PACKAGE_DIR" />
+              <add key="nuget" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          NUGET
+
+          dotnet add "$consumer_dir" package "$PACKAGE_ID" --version "$version" >/dev/null
+
+          cat > "$consumer_dir/Program.cs" <<'CS'
+          using DotnetSimpleImportOrchestrator;
+
+          Console.WriteLine(typeof(IImportConfiguration).Assembly.GetName().Name);
+          CS
+
+          dotnet run --project "$consumer_dir" --configuration Release >/dev/null
+
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.version }}"
+          package_file="$PACKAGE_DIR/$PACKAGE_ID.$version.nupkg"
+
+          dotnet nuget push "$package_file" \
+            --api-key "$NUGET_API_KEY" \
+            --source "$NUGET_SOURCE" \
+            --skip-duplicate
